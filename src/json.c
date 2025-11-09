@@ -204,20 +204,19 @@ symset_expand (symset_t *ss)
     {
       Lisp_Object sym = old_table->entries[i];
       if (!BASE_EQ (sym, Qunbound))
-	{
-	  ptrdiff_t j = symset_hash (sym, bits);
-	  while (!BASE_EQ (tbl->entries[j], Qunbound))
-	    j = (j + 1) & mask;
-	  tbl->entries[j] = sym;
-	}
+        {
+          ptrdiff_t j = symset_hash (sym, bits);
+          while (!BASE_EQ (tbl->entries[j], Qunbound))
+            j = (j + 1) & mask;
+          tbl->entries[j] = sym;
+        }
     }
   xfree (old_table);
 }
 
-/* If sym is in ss, return false; otherwise add it and return true.
-   Comparison is done by strict identity.  */
+/* If sym is in ss, return false; otherwise add it and return true. */
 static inline bool
-symset_add (json_out_t *jo, symset_t *ss, Lisp_Object sym)
+symset_add (json_out_t *jo, symset_t *ss, Lisp_Object obj)
 {
   /* Make sure we don't fill more than half of the table.  */
   if (ss->count >= (symset_size (ss->bits) >> 1))
@@ -228,17 +227,34 @@ symset_add (json_out_t *jo, symset_t *ss, Lisp_Object sym)
 
   struct symset_tbl *tbl = ss->table;
   ptrdiff_t mask = symset_size (ss->bits) - 1;
-  for (ptrdiff_t i = symset_hash (sym, ss->bits); ; i = (i + 1) & mask)
+  /* XXX Does not work because symset_hash only supports symbols */
+  for (ptrdiff_t i = symset_hash (obj, ss->bits); ; i = (i + 1) & mask)
     {
-      Lisp_Object s = tbl->entries[i];
-      if (BASE_EQ (s, sym))
-	return false;		/* Previous occurrence found.  */
-      if (BASE_EQ (s, Qunbound))
+      Lisp_Object eobj = tbl->entries[i];
+
+      if (BASE_EQ (eobj, Qunbound))
+        {
+          /* Not in set, add it.  */
+          tbl->entries[i] = obj;
+          ss->count++;
+          return true;
+        }
+
+      if (BARE_SYMBOL_P (obj) && BARE_SYMBOL_P (eobj))
 	{
-	  /* Not in set, add it.  */
-	  tbl->entries[i] = sym;
-	  ss->count++;
-	  return true;
+	  if (BASE_EQ (obj, eobj))
+	    return false;
+	}
+      else
+	{
+	  Lisp_Object estr = BARE_SYMBOL_P (eobj) ?
+	    SYMBOL_NAME (eobj) : eobj;
+	  Lisp_Object str = BARE_SYMBOL_P (obj) ?
+	    SYMBOL_NAME (obj) : obj;
+
+	  if (SBYTES (str) == SBYTES (estr) &&
+	      memcmp (SDATA (str), SDATA (estr), SBYTES (str)) == 0)
+	    return false;
 	}
     }
 }
@@ -425,6 +441,11 @@ json_out_object_cons (json_out_t *jo, Lisp_Object obj)
   bool is_alist = CONSP (XCAR (obj));
   bool first = true;
   Lisp_Object tail = obj;
+  Lisp_Object key_str;
+  const char *str = NULL;
+  ptrdiff_t len = 0;
+  int skip = 0;
+
   FOR_EACH_TAIL (tail)
     {
       Lisp_Object key;
@@ -444,7 +465,26 @@ json_out_object_cons (json_out_t *jo, Lisp_Object obj)
 	  value = XCAR (tail);
 	}
       key = maybe_remove_pos_from_symbol (key);
-      CHECK_TYPE (BARE_SYMBOL_P (key), Qsymbolp, key);
+
+      if (BARE_SYMBOL_P (key))
+        {
+          key_str = SYMBOL_NAME (key);
+          str = SSDATA (key_str);
+          len = SBYTES (key_str);
+          /* Skip leading ':' in plist keys */
+          skip = !is_alist && len > 1 && str[0] == ':' ? 1 : 0;
+        }
+      else if (STRINGP (key))
+        {
+          key_str = key;
+          str = SSDATA (key_str);
+          len = SBYTES (key_str);
+        }
+      else
+        {
+          signal_error ("JSON object key must be a symbol or a string",
+			key);
+        }
 
       if (symset_add (jo, &ss, key))
 	{
@@ -452,10 +492,6 @@ json_out_object_cons (json_out_t *jo, Lisp_Object obj)
 	    json_out_byte (jo, ',');
 	  first = false;
 
-	  Lisp_Object key_str = SYMBOL_NAME (key);
-	  const char *str = SSDATA (key_str);
-	  /* Skip leading ':' in plist keys.  */
-	  int skip = !is_alist && str[0] == ':' && str[1] ? 1 : 0;
 	  json_out_string (jo, key_str, skip);
 	  json_out_byte (jo, ':');
 	  json_out_something (jo, value);
